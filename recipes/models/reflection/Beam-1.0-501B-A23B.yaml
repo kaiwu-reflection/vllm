@@ -4,7 +4,7 @@ meta:
   provider: "Reflection"
   description: "Reflection's Beam — a sparse MoE language model (501B total / 23B active) with hybrid sliding-window + NoPE full attention, a 1M-token window, Harmony-format reasoning and tool calling, and an optional DFlash2 speculative drafter. Available in NVFP4, FP8 and BF16 on NVIDIA and BF16 on AMD ROCm."
   date_added: 2026-10-16
-  date_updated: 2026-10-23
+  date_updated: 2026-11-24
   tasks:
     - text
   performance_headline: "501B/23B-active MoE with hybrid sliding-window attention, 1M context, and DFlash2 speculative decoding"
@@ -12,6 +12,7 @@ meta:
   hardware:
     b300: verified
     h200: verified
+    rtx_pro_6000: verified
     mi300x: supported
     mi325x: verified
     mi350x: verified
@@ -76,6 +77,12 @@ features:
         args:
           - "--speculative-config"
           - '{"method":"dflash","model":"reflection/Beam-1.0-501B-A23B-DFlash2","num_speculative_tokens":7,"enable_adaptive_verification":true}'
+      # SM120 has no attention backend that supports adaptive verification
+      # (FA2 and FlashInfer both reject it there).
+      rtx_pro_6000:
+        args:
+          - "--speculative-config"
+          - '{"method":"dflash","model":"reflection/Beam-1.0-501B-A23B-DFlash2","num_speculative_tokens":7,"attention_backend":"FLASH_ATTN"}'
 
 opt_in_features:
   - spec_decoding
@@ -101,11 +108,13 @@ variants:
       - "arch:sm90"
       - "arch:sm100"
       - "arch:sm103"
+      - rtx_pro_6000
     # Blackwell runs TP4: 353 GB fits 4x B200 (720 GB) and one GB200/GB300
     # tray, and TP8 would leave 320 intermediate rows per rank (padded).
-    # Hopper runs TP8.
+    # Hopper runs TP8. 4x RTX PRO 6000 (384 GB) also runs TP4.
     tp:
       blackwell: 4
+      rtx_pro_6000: 4
     # Blackwell auto-selects flashinfer_trtllm for the MoE, so only Hopper
     # needs a pin.
     hardware_overrides:
@@ -114,6 +123,23 @@ variants:
         extra_args:
           - "--moe-backend"
           - "marlin"
+      rtx_pro_6000:
+        # BF16 KV keeps FlashAttention for both target and drafter; FA2
+        # rejects an FP8 KV cache on SM120. A 16K prefill budget measured
+        # +8% at 64 concurrent requests. The FlashInfer CUTLASS MoE allocates
+        # its workspace per call, outside the measured activation peak, so
+        # leave 10% of memory for it; the default 1.0 ran out of memory under
+        # load. The PCIe IPC all-reduce is on by default in newer vLLM; the
+        # variable enables it in images that predate that.
+        extra_args:
+          - "--kv-cache-dtype"
+          - "auto"
+          - "--max-num-batched-tokens"
+          - "16384"
+          - "--gpu-memory-utilization"
+          - "0.9"
+        extra_env:
+          VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: "1"
   fp8:
     model_id: "reflection/Beam-1.0-501B-A23B-FP8"
     precision: fp8
@@ -272,6 +298,42 @@ guide: |
   first start takes about 10 minutes because FlashInfer autotunes the MoE
   kernel. That is close to vLLM's default 600 s engine-ready timeout, so the
   generated command sets `VLLM_ENGINE_READY_TIMEOUT_S=3600`.
+
+  ### NVFP4 with TP4 on RTX PRO 6000 (SM120)
+
+  ```bash
+  VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1 \
+  vllm serve reflection/Beam-1.0-501B-A23B-NVFP4 \
+    --tensor-parallel-size 4 \
+    --kv-cache-dtype auto \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.9 \
+    --speculative-config '{"method":"dflash","model":"reflection/Beam-1.0-501B-A23B-DFlash2","num_speculative_tokens":7,"attention_backend":"FLASH_ATTN"}' \
+    --enable-auto-tool-choice \
+    --tool-call-parser beam \
+    --reasoning-parser beam
+  ```
+
+  Measured on 4x RTX PRO 6000 Server Edition (96 GB, PCIe, no NVLink) with
+  SPEED-Bench `throughput_1k` (real rows, 1,024 output tokens): 195, 1,182 and
+  1,801 output tokens/s at 1, 30 and 64 concurrent requests. GSM8K (temperature
+  0.7, top-p 0.99) scored 95.8%.
+
+  - **All-reduce:** without NVLink, vLLM's custom all-reduce turns off above
+    two GPUs. FlashInfer's PCIe IPC all-reduce replaces NCCL, which is
+    9-13% slower here.
+  - **KV cache:** keep it in BF16. FlashAttention 2, the SM120 backend Beam
+    fuses its KV-cache write into, does not support an FP8 KV cache. For
+    throughput, `--kv-cache-dtype fp8 --attention-backend FLASHINFER` with
+    `"attention_backend":"FLASHINFER"` in the drafter config measured +1-3%
+    at 30-64 requests and -9% at 1 (GSM8K 96.5%).
+  - **Speculative decoding:** omit `enable_adaptive_verification`; no SM120
+    attention backend supports it yet.
+  - **MoE:** the default FlashInfer CUTLASS backend is fastest; `b12x` ties
+    it and `flashinfer_b12x` runs out of memory.
+  - **Driver:** CUDA 13.2 builds need a newer driver than 580 (CUDA 13.0).
+    On 580, FlashAttention fails with "the provided PTX was compiled with an
+    unsupported toolchain".
 
   ### NVFP4 with TP8 on H100
 
