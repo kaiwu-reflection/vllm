@@ -194,9 +194,6 @@ def _warmup_bf16x3_router_gemm(
     model: torch.nn.Module,
     max_num_tokens: int,
 ) -> None:
-    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm100 import (  # noqa: E501
-        warmup_bf16x3_router_gemm,
-    )
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
     gate = next(
@@ -212,6 +209,21 @@ def _warmup_bf16x3_router_gemm(
             "Skipping BF16x3 router GEMM warmup: no eligible GateLinear found."
         )
         return
+
+    if gate.is_sm120:
+        from vllm.model_executor.layers.fused_moe.router import (
+            bf16x3_router_gemm_sm120,
+        )
+
+        sizes = bf16x3_router_gemm_sm120.warmup(
+            gate.input_size, gate.output_size, max_num_tokens, gate.weight.device
+        )
+        logger.info_once("Warmed up SM120 BF16x3 router GEMM for M=%s.", tuple(sizes))
+        return
+
+    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm100 import (  # noqa: E501
+        warmup_bf16x3_router_gemm,
+    )
 
     min_num_tokens = gate.FP32_MAX_TOKENS + 1 if gate.allow_fp32_router_gemm else 1
     logger.info_once(
@@ -327,7 +339,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         watermark_sample_warmup(worker)
         qwen4_exp_qsa_triton_warmup(worker)
 
-    if enable_jit_warmup and current_platform.is_device_capability_family(100):
+    if enable_jit_warmup and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+    ):
         _warmup_bf16x3_router_gemm(
             worker.get_model(),
             worker.scheduler_config.max_num_batched_tokens,

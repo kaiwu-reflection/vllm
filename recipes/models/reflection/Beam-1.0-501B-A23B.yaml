@@ -315,9 +315,9 @@ guide: |
   ```
 
   Measured on 4x RTX PRO 6000 Server Edition (96 GB, PCIe, no NVLink) with
-  SPEED-Bench `throughput_1k` (real rows, 1,024 output tokens): 195, 1,182 and
-  1,801 output tokens/s at 1, 30 and 64 concurrent requests. GSM8K (temperature
-  0.7, top-p 0.99) scored 95.8%.
+  SPEED-Bench `throughput_1k` (real rows, 1,024 output tokens): 210, 1,187 and
+  1,823 output tokens/s at 1, 30 and 64 concurrent requests. GSM8K (temperature
+  0.7, top-p 0.99) scored 96.7%.
 
   - **All-reduce:** without NVLink, vLLM's custom all-reduce turns off above
     two GPUs. FlashInfer's PCIe IPC all-reduce replaces NCCL, which is
@@ -327,6 +327,8 @@ guide: |
     throughput, `--kv-cache-dtype fp8 --attention-backend FLASHINFER` with
     `"attention_backend":"FLASHINFER"` in the drafter config measured +1-3%
     at 30-64 requests and -9% at 1 (GSM8K 96.5%).
+  - **Router:** the FP32 router GEMM runs on an SM120 BF16x3 tensor-core
+    kernel instead of an FP32 SIMT GEMM.
   - **Speculative decoding:** omit `enable_adaptive_verification`; no SM120
     attention backend supports it yet.
   - **MoE:** the default FlashInfer CUTLASS backend is fastest; `b12x` ties

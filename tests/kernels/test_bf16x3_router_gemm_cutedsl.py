@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the CuteDSL BF16x3 router GEMMs (SM90 and SM100)."""
+"""Tests for the BF16x3 router GEMMs (CuteDSL on SM90/SM100, Triton on SM120)."""
 
 import pytest
 import torch
@@ -239,3 +239,76 @@ def test_gate_linear_bf16x3_tier_traces_fullgraph(monkeypatch):
 
     eager_out, _ = gate(x)
     torch.testing.assert_close(out, eager_out, rtol=0, atol=0)
+
+
+def _requires_sm120():
+    if not current_platform.is_device_capability_family(120):
+        pytest.skip("SM120 bf16x3 router GEMM requires an SM120 GPU")
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "num_experts"),
+    [
+        (8, 5120, 256),  # Beam decode with 7 draft tokens
+        (240, 5120, 256),
+        (1025, 5120, 256),  # no split-K
+        (64, 5120, 160),  # N not a multiple of 64
+        (33, 2816, 256),  # K needs a smaller split
+    ],
+)
+def test_sm120_bf16x3_router_gemm_matches_fp32(num_tokens, hidden_size, num_experts):
+    """SM120 has no FP32 tensor-core GEMM; the BF16x3 split must still give
+    FP32-accurate logits, so routing matches the SM90/SM100 kernels."""
+    _requires_sm120()
+    from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm120 import (  # noqa: E501
+        bf16x3_router_gemm,
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden_size, device="cuda").to(torch.bfloat16)
+    w = torch.randn(num_experts, hidden_size, device="cuda") * ROUTER_WEIGHT_SCALE
+    ref = torch.nn.functional.linear(x.double(), w.double())
+    out = bf16x3_router_gemm(x, w)
+
+    assert out.dtype == torch.float32
+    assert torch.mean(torch.abs(out.double() - ref)).item() < 1e-6
+    torch.testing.assert_close(out.double(), ref, rtol=0, atol=1e-5)
+    # Split-K partials are reduced in a fixed order.
+    assert torch.equal(out, bf16x3_router_gemm(x, w))
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "uses_bf16x3"),
+    [(4, False), (8, True), (240, True)],
+)
+def test_sm120_gate_linear_dispatch(monkeypatch, num_tokens, uses_bf16x3):
+    """Beam's router on SM120: the fp32 GEMV below 8 tokens, BF16x3 above,
+    never the FP32 SIMT fallback."""
+    _requires_sm120()
+    _use_single_rank(monkeypatch)
+    from vllm.model_executor.layers.fused_moe.router import bf16x3_router_gemm_sm120
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    calls = []
+    real = bf16x3_router_gemm_sm120._bf16x3_router_gemm
+
+    def record(x, w):
+        calls.append(x.shape[0])
+        return real(x, w)
+
+    monkeypatch.setattr(bf16x3_router_gemm_sm120, "_bf16x3_router_gemm", record)
+    gate = GateLinear(
+        input_size=5120,
+        output_size=256,
+        bias=False,
+        out_dtype=torch.float32,
+        params_dtype=torch.float32,
+    ).cuda()
+    gate.weight.data.normal_(0, ROUTER_WEIGHT_SCALE)
+    x = torch.randn(num_tokens, 5120, device="cuda").to(torch.bfloat16)
+    out, _ = gate(x)
+
+    assert gate.allow_fp32_router_gemm and gate.allow_bf16x3_router_gemm
+    assert calls == ([num_tokens] if uses_bf16x3 else [])
+    ref = torch.nn.functional.linear(x.double(), gate.weight.double())
+    torch.testing.assert_close(out.double(), ref, rtol=0, atol=1e-5)

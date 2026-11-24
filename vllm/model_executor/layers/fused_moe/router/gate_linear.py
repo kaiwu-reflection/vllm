@@ -32,7 +32,8 @@ class GateLinear(ReplicatedLinear):
        model-specific shapes and batch limits, gfx950 any shape with M<=32)
     3. cuteDSL ll_fp32w_gemm (SM90+, M<=32, bf16/fp32 in, fp32 out,
        any shape)
-    4. bf16x3 CuteDSL kernel (SM90 or SM100, bf16 in, fp32 weight)
+    4. bf16x3 kernel (SM90/SM100 CuteDSL or SM120 Triton, bf16 in,
+       fp32 weight)
     5. ROCm bf16x3 router GEMM (gfx950, bf16 in, fp32 weight, fp32 out,
        M>=2048)
     6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype); gfx950
@@ -78,6 +79,7 @@ class GateLinear(ReplicatedLinear):
     ):
         is_hopper = current_platform.is_device_capability((9, 0))
         is_blackwell = current_platform.is_device_capability_family(100)
+        is_sm120 = current_platform.is_device_capability_family(120)
         cdna_version = 0
         if current_platform.is_rocm():
             from vllm.platforms.rocm import get_cdna_version
@@ -108,6 +110,7 @@ class GateLinear(ReplicatedLinear):
         )
         self.out_dtype = out_dtype
         self.is_hopper = is_hopper
+        self.is_sm120 = is_sm120
         self.cdna_version = cdna_version
 
         # A quantized gate exposes no plain ``weight``, so every specialized
@@ -126,21 +129,30 @@ class GateLinear(ReplicatedLinear):
             and (
                 (
                     current_platform.is_cuda()
-                    and (is_hopper or is_blackwell)
+                    and (is_hopper or is_blackwell or is_sm120)
                     and (input_size, output_size) in self.FP32_SUPPORTED_SHAPES
                 )
                 # FP32 weights: gfx950 only. The gfx1250 path needs BF16 weights.
                 or cdna_version == 4
             )
         )
+        sm120_bf16x3_shape = False
+        if is_sm120:
+            from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm120 import (  # noqa: E501
+                shape_supported,
+            )
+
+            sm120_bf16x3_shape = shape_supported(input_size, output_size)
         self.allow_bf16x3_router_gemm = (
             self.is_unquantized
             and not batch_invariant
             and not bias
             and self.weight.dtype == torch.float32
             and current_platform.is_cuda()
-            and (is_hopper or is_blackwell)
-            and input_size % 8 == 0
+            and (
+                ((is_hopper or is_blackwell) and input_size % 8 == 0)
+                or sm120_bf16x3_shape
+            )
         )
 
         # Fused bf16 x bf16 -> fp32 GEMM eligibility. torch.mm's out_dtype
@@ -361,7 +373,13 @@ class GateLinear(ReplicatedLinear):
         # Tier 4: bf16x3 CuteDSL kernel for fp32 router weights. The arch comes
         # from __init__: a device query here breaks fullgraph torch.compile.
         if self.allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
-            if self.is_hopper:
+            if self.is_sm120:
+                from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm120 import (  # noqa: E501
+                    bf16x3_router_gemm as sm120_bf16x3_router_gemm,
+                )
+
+                output = sm120_bf16x3_router_gemm(x.contiguous(), self.weight)
+            elif self.is_hopper:
                 from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm90 import (  # noqa: E501
                     bf16x3_router_gemm as sm90_bf16x3_router_gemm,
                 )
@@ -443,6 +461,8 @@ _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
 # H200: BF16x3 overtakes the fp32 kernel at 18-28 tokens depending on the
 # shape; 24 keeps every instantiated shape within 1.5 us of the faster one.
 _SM90_FP32_ROUTER_GEMM_MAX_TOKENS = 24
+# RTX PRO 6000: BF16x3 overtakes the fp32 kernel at 8 tokens for (5120, 256).
+_SM120_FP32_ROUTER_GEMM_MAX_TOKENS = 7
 
 
 @cache
@@ -451,12 +471,23 @@ def _is_hopper() -> bool:
 
 
 @cache
+def _is_sm120() -> bool:
+    return current_platform.is_device_capability_family(120)
+
+
+@cache
 def bf16x3_router_gemm_module():
-    """The CuteDSL bf16x3 router GEMM module for this device (SM90 or SM100).
+    """The bf16x3 router GEMM module for this device (SM90, SM100 or SM120).
 
     Only for code that Dynamo does not trace, such as custom op bodies: Dynamo
     ignores `@cache` and would trace the device query.
     """
+    if _is_sm120():
+        from vllm.model_executor.layers.fused_moe.router import (
+            bf16x3_router_gemm_sm120,
+        )
+
+        return bf16x3_router_gemm_sm120
     if _is_hopper():
         from vllm.model_executor.layers.fused_moe.router import (
             bf16x3_router_gemm_sm90,
@@ -571,7 +602,9 @@ def fp32_router_gemm_dispatch_impl(
         return torch.nn.functional.linear(x.float(), weight)
     max_tokens = _FP32_ROUTER_GEMM_MAX_TOKENS
     if allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
-        if _is_hopper():
+        if _is_sm120():
+            max_tokens = _SM120_FP32_ROUTER_GEMM_MAX_TOKENS
+        elif _is_hopper():
             max_tokens = _SM90_FP32_ROUTER_GEMM_MAX_TOKENS
         elif weight.shape == (256, 5120):
             # GB200: four token groups win through 48 for multiples of eight.
@@ -587,7 +620,7 @@ def fp32_router_gemm_dispatch_impl(
         return ops.fp32_router_gemm(x, weight)
 
     if allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
-        return bf16x3_router_gemm_module()._bf16x3_router_gemm(x, weight)
+        return bf16x3_router_gemm_module()._bf16x3_router_gemm(x.contiguous(), weight)
 
     return torch.nn.functional.linear(x.float(), weight)
 
