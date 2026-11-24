@@ -93,10 +93,11 @@ def shape_supported(k: int, n: int) -> bool:
 
 
 def _bf16x3_router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    x = x.contiguous()
     m, k = x.shape
     n = weight.shape[0]
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.float32
-    assert x.is_contiguous() and weight.is_contiguous()
+    assert weight.is_contiguous()
     assert weight.shape[1] == k and shape_supported(k, n)
     out = torch.empty((m, n), device=x.device, dtype=torch.float32)
     if m == 0:

@@ -378,7 +378,7 @@ class GateLinear(ReplicatedLinear):
                     bf16x3_router_gemm as sm120_bf16x3_router_gemm,
                 )
 
-                output = sm120_bf16x3_router_gemm(x.contiguous(), self.weight)
+                output = sm120_bf16x3_router_gemm(x, self.weight)
             elif self.is_hopper:
                 from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_sm90 import (  # noqa: E501
                     bf16x3_router_gemm as sm90_bf16x3_router_gemm,
@@ -620,7 +620,7 @@ def fp32_router_gemm_dispatch_impl(
         return ops.fp32_router_gemm(x, weight)
 
     if allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
-        return bf16x3_router_gemm_module()._bf16x3_router_gemm(x.contiguous(), weight)
+        return bf16x3_router_gemm_module()._bf16x3_router_gemm(x, weight)
 
     return torch.nn.functional.linear(x.float(), weight)
 
